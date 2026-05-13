@@ -1,0 +1,176 @@
+services:
+  kafka:
+    image: apache/kafka:3.7.2
+    container_name: wiki-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: wiki-kafka-ui
+    ports:
+      - "8080:8080"
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: wiki
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  cassandra:
+    image: cassandra:4.1
+    container_name: wiki-cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: wiki-cluster
+
+  minio:
+    image: minio/minio:latest
+    container_name: wiki-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+
+  spark-master:
+    image: spark:3.5.1-python3
+    container_name: wiki-spark-master
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+
+  init:
+    image: python:3.11-slim
+    container_name: wiki-init
+    depends_on:
+      - kafka
+      - cassandra
+      - minio
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      sh -c "
+      pip install --no-cache-dir cassandra-driver kafka-python boto3 &&
+      python scripts/init_infra.py
+      "
+
+  ingestion:
+    build:
+      context: ./services/ingestion
+      dockerfile: Dockerfile
+    container_name: wiki-ingestion
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: page-create-events
+    restart: on-failure
+
+  spark-worker:
+    image: spark:3.5.1-python3
+    container_name: wiki-spark-worker
+    depends_on:
+      - spark-master
+    ports:
+      - "8082:8081"
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      --cores 4
+      --memory 1g
+      spark://spark-master:7077
+
+  spark-worker-2:
+    image: spark:3.5.1-python3
+    container_name: wiki-spark-worker-2
+    depends_on:
+      - spark-master
+    ports:
+      - "8083:8081"
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      --cores 4
+      --memory 1g
+      spark://spark-master:7077
+
+
+  spark-batch:
+    build:
+      context: ./services/spark
+      dockerfile: Dockerfile
+    container_name: wiki-spark-batch
+    depends_on:
+      - kafka
+      - cassandra
+      - minio
+      - spark-master
+      - spark-worker
+      - spark-worker-2
+      - init
+    environment:
+      HOME: /home/spark
+      IVY_HOME: /home/spark/.ivy2
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --conf spark.cores.max=4
+      --conf spark.executor.cores=2
+      --packages com.datastax.spark:spark-cassandra-connector_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4
+      /app/jobs/batch_job.py
+    restart: "no"
+
+  spark-streaming:
+    build:
+      context: ./services/spark
+      dockerfile: Dockerfile
+    container_name: wiki-spark-streaming
+    depends_on:
+      - kafka
+      - cassandra
+      - minio
+      - spark-master
+      - spark-worker
+      - spark-worker-2
+      - init
+    environment:
+      HOME: /home/spark
+      IVY_HOME: /home/spark/.ivy2
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --conf spark.cores.max=4
+      --conf spark.executor.cores=2
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.datastax.spark:spark-cassandra-connector_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4
+      /app/jobs/streaming_job.py
+    restart: on-failure
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: wiki-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - cassandra
+      - init
+    environment:
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_KEYSPACE: wiki_analytics
+    restart: on-failure
